@@ -1,0 +1,40 @@
+---
+title: "NYC_LandCover_df_merge"
+output: html_document
+date: "2024-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary library
+library(dplyr)
+
+# Set the directory containing your CSV files
+LandCover_dfs <- "/Volumes/Elements/R/Projects/LandCover/LandCover_dfs"
+
+# List all CSV files in the folder
+lc_files <- list.files(path = LandCover_dfs, pattern = "\\.csv$", full.names = TRUE)
+
+# Read and combine all CSV files into a single dataframe
+combined_df <- lc_files %>%
+  lapply(read.csv) %>% # Read each CSV file into a list
+  bind_rows()         # Combine all dataframes into one
+
+# View the combined dataframe
+print(combined_df)
+```
+
+```{r}
+# Replace all NA values in the dataframe with 0
+combined_df[is.na(combined_df)] <- 0
+```
+
+
+```{r}
+# Save dataframe as a CSV file
+#write.csv(combined_df, "/Volumes/Elements/R/Projects/LandCover/LandCoverCharacteristics.csv", row.names = FALSE)
+```
+

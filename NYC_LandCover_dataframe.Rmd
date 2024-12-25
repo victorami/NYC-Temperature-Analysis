@@ -1,0 +1,492 @@
+---
+title: "NYC_LandCover_dataframe"
+output: html_document
+date: "2024-11-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(sf)
+library(raster)
+library(dplyr)
+library(lubridate)
+```
+
+```{r}
+landcover_raster <- raster("/Volumes/Elements/Data/Land_Cover/NYC_2017_LiDAR_LandCover.img")
+buildings_geojson <- "/Volumes/Elements/Data/Building_Footprints/Building Footprints_20241119.geojson"
+temperature <- read.csv("/Volumes/Elements/Data/Hyperlocal_Temperature_NYC/Hyperlocal_Temperature_Monitoring_20240919.csv")
+
+sensor_list <- temperature[!duplicated(temperature[, c("Sensor.ID", "Latitude", "Longitude")]), c("Sensor.ID", "Latitude", "Longitude")]
+hyptemp <- sensor_list
+rownames(hyptemp) <- NULL
+```
+
+# fucntion 
+```{r}
+generate_landcover_and_building_data <- function(
+  coordinates,       # Numeric vector: c(longitude, latitude)
+  buffer_distance,   # Numeric: Buffer distance in the CRS unit
+  landcover_raster,  # RasterLayer: The landcover raster
+  buildings_geojson, # Filepath or sf object: The building footprints GeoJSON
+  hyptemp            # DataFrame: Contains temperature data with Latitude and Longitude columns
+) {
+  # Helper function to reproject and clip spatial data
+  reproject_and_clip <- function(data, target_crs, extent_bbox) {
+    data_transformed <- st_transform(data, crs = target_crs)
+    data_clipped <- st_intersection(data_transformed, st_as_sf(extent_bbox))
+    return(data_clipped)
+  }
+  
+  # Step 1: Define the input point in WGS84 and transform it to the raster's CRS
+  point_sf <- st_sfc(st_point(coordinates), crs = 4326)
+  point_transformed <- st_transform(point_sf, crs = st_crs(landcover_raster))
+  
+  # Step 2: Create a buffer and crop the raster
+  buffer <- st_buffer(point_transformed, dist = buffer_distance)
+  bbox <- st_bbox(buffer)
+  cropped_raster <- crop(landcover_raster, extent(bbox$xmin, bbox$xmax, bbox$ymin, bbox$ymax))
+  raster_extent <- as(extent(cropped_raster), "SpatialPolygons")
+  crs(raster_extent) <- crs(landcover_raster)
+  
+  # Step 3: Read and preprocess buildings GeoJSON
+  buildings_sf <- if (is.character(buildings_geojson)) {
+    st_read(buildings_geojson, quiet = TRUE)
+  } else {
+    buildings_geojson
+  }
+  
+  # Step 4: Filter and categorize buildings by height
+  buildings_with_height <- buildings_sf %>%
+    filter(!is.na(heightroof)) %>%
+    mutate(height_category = case_when(
+      heightroof <= 20 ~ "Low",
+      heightroof <= 40 ~ "Medium",
+      heightroof > 40 ~ "Tall",
+      TRUE ~ "Unknown"
+    ))
+  
+  buildings_without_height <- buildings_sf %>%
+    filter(is.na(heightroof))
+  
+  # Step 5: Reproject and clip buildings to raster extent
+  buildings_with_height_clipped <- reproject_and_clip(buildings_with_height, crs(landcover_raster), raster_extent)
+  buildings_without_height_clipped <- reproject_and_clip(buildings_without_height, crs(landcover_raster), raster_extent)
+  
+  # Step 6: Filter hyptemp dataset for the sensors in the area of interest
+  hyptemp_sf <- st_as_sf(hyptemp, coords = c("Longitude", "Latitude"), crs = 4326)
+  hyptemp_clipped <- reproject_and_clip(hyptemp_sf, crs(landcover_raster), raster_extent)
+  
+  # Step 7: Extract raster values into a data frame
+  raster_df <- as.data.frame(rasterToPoints(cropped_raster), xy = TRUE)
+  names(raster_df)[3] <- "landcover_value"
+  
+  # Step 8: Convert buildings and sensors to data frames
+  buildings_with_height_df <- as.data.frame(buildings_with_height_clipped)
+  buildings_without_height_df <- as.data.frame(buildings_without_height_clipped)
+  hyptemp_df <- as.data.frame(hyptemp_clipped)
+  
+  # Return the data as a list of data frames
+  return(list(
+    landcover = raster_df,
+    buildings_with_height = buildings_with_height_df,
+    sensors = hyptemp_df
+  ))
+}
+
+```
+
+# for loop that processes all rows
+```{r}
+# Initialize an empty data frame to store results
+populated_df <- data.frame(
+  Sensor.ID = character(),
+  Latitude = numeric(),
+  Longitude = numeric(),
+  Buffer = numeric(),
+  TreeCanopy_pct = numeric(),
+  GrassShrubs_pct = numeric(),
+  BareSoil_pct = numeric(),
+  Water_pct = numeric(),
+  Buildings_pct = numeric(),
+  Roads_pct = numeric(),
+  OtherImp_pct = numeric(),
+  Railroads_pct = numeric(),
+  Building_mean = numeric(),
+  Building_median = numeric(),
+  BuildingAge_mean = numeric(),
+  BuildingAge_median = numeric(),
+  BuildingLow_pct = numeric(),
+  BuildingMedium_pct = numeric(),
+  BuildingTall_pct = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Define buffer distance
+buffer_distance <- 250
+
+# Loop through each sensor in the hyptemp dataset
+for (i in seq_len(nrow(hyptemp))) {
+  # Extract sensor information
+  sensor_id <- hyptemp$Sensor.ID[i]
+  latitude <- hyptemp$Latitude[i]
+  longitude <- hyptemp$Longitude[i]
+  
+  # Call the function for the current sensor
+  result <- generate_landcover_and_building_data(
+    coordinates = c(longitude, latitude),
+    buffer_distance = buffer_distance,
+    landcover_raster = landcover_raster,
+    buildings_geojson = buildings_geojson,
+    hyptemp = hyptemp
+  )
+  
+  # Extract individual results
+  landcover_data <- result$landcover
+  buildings_with_height <- result$buildings_with_height
+  
+  # Calculate landcover percentages
+  landcover_totals <- prop.table(table(landcover_data$landcover_value))
+  tree_canopy_pct <- 100 * landcover_totals["1"]
+  grass_shrubs_pct <- 100 * landcover_totals["2"]
+  bare_soil_pct <- 100 * landcover_totals["3"]
+  water_pct <- 100 * landcover_totals["4"]
+  buildings_pct <- 100 * landcover_totals["5"]
+  roads_pct <- 100 * landcover_totals["6"]
+  other_imp_pct <- 100 * landcover_totals["7"]
+  railroads_pct <- 100 * landcover_totals["8"]
+  
+  # Calculate building metrics
+  building_mean <- mean(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+  building_median <- median(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+  height_categories <- prop.table(table(buildings_with_height$height_category))
+  building_low_pct <- 100 * height_categories["Low"]
+  building_medium_pct <- 100 * height_categories["Medium"]
+  building_tall_pct <- 100 * height_categories["Tall"]
+  
+  # Calculate building age metrics
+  if ("cnstrct_yr" %in% names(buildings_with_height)) {
+    building_age_mean <- round(mean(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE))
+    building_age_median <- median(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE)
+  } else {
+    building_age_mean <- NA
+    building_age_median <- NA
+  }
+  
+  # Create a row for the current sensor
+  computed_row <- data.frame(
+    Sensor.ID = sensor_id,
+    Latitude = latitude,
+    Longitude = longitude,
+    Buffer = buffer_distance,
+    TreeCanopy_pct = tree_canopy_pct,
+    GrassShrubs_pct = grass_shrubs_pct,
+    BareSoil_pct = bare_soil_pct,
+    Water_pct = water_pct,
+    Buildings_pct = buildings_pct,
+    Roads_pct = roads_pct,
+    OtherImp_pct = other_imp_pct,
+    Railroads_pct = railroads_pct,
+    Building_mean = building_mean,
+    Building_median = building_median,
+    BuildingAge_mean = building_age_mean,
+    BuildingAge_median = building_age_median,
+    BuildingLow_pct = building_low_pct,
+    BuildingMedium_pct = building_medium_pct,
+    BuildingTall_pct = building_tall_pct,
+    stringsAsFactors = FALSE
+  )
+  
+  # Append the row to the populated data frame
+  populated_df <- bind_rows(populated_df, computed_row)
+}
+
+# Final populated data frame
+rownames(populated_df) <- NULL
+print(populated_df)
+```
+
+# for loop that processes a defined number of locations at a time
+```{r}
+# Define buffer distance
+buffer_distance <- 250
+
+# Number of locations per chunk
+chunk_size <- 20
+
+# Total number of rows
+total_rows <- nrow(hyptemp)
+
+# Define the save path
+save_path <- "/Volumes/Elements/R/Projects/LandCover/LandCover_dfs"
+
+# Create the directory if it doesn't exist
+if (!dir.exists(save_path)) {
+  dir.create(save_path, recursive = TRUE)
+}
+
+# Loop through chunks
+for (start_row in seq(1, total_rows, by = chunk_size)) {
+  # Get the end row for the current chunk
+  end_row <- min(start_row + chunk_size - 1, total_rows)
+  
+  # Subset the current chunk
+  chunk <- hyptemp[start_row:end_row, ]
+  
+  # Initialize a temporary data frame for the current chunk's results
+  chunk_df <- data.frame(
+    Sensor.ID = character(),
+    Latitude = numeric(),
+    Longitude = numeric(),
+    Buffer = numeric(),
+    TreeCanopy_pct = numeric(),
+    GrassShrubs_pct = numeric(),
+    BareSoil_pct = numeric(),
+    Water_pct = numeric(),
+    Buildings_pct = numeric(),
+    Roads_pct = numeric(),
+    OtherImp_pct = numeric(),
+    Railroads_pct = numeric(),
+    Building_mean = numeric(),
+    Building_median = numeric(),
+    BuildingAge_mean = numeric(),
+    BuildingAge_median = numeric(),
+    BuildingLow_pct = numeric(),
+    BuildingMedium_pct = numeric(),
+    BuildingTall_pct = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop through each row in the chunk
+  for (i in seq_len(nrow(chunk))) {
+    # Extract sensor information
+    sensor_id <- chunk$Sensor.ID[i]
+    latitude <- chunk$Latitude[i]
+    longitude <- chunk$Longitude[i]
+    
+    # Call the function for the current sensor
+    result <- generate_landcover_and_building_data(
+      coordinates = c(longitude, latitude),
+      buffer_distance = buffer_distance,
+      landcover_raster = landcover_raster,
+      buildings_geojson = buildings_geojson,
+      hyptemp = chunk
+    )
+    
+    # Extract and compute results (as in the original loop)
+    landcover_data <- result$landcover
+    buildings_with_height <- result$buildings_with_height
+    landcover_totals <- prop.table(table(landcover_data$landcover_value))
+    
+    # Calculate landcover and building metrics
+    tree_canopy_pct <- 100 * landcover_totals["1"]
+    grass_shrubs_pct <- 100 * landcover_totals["2"]
+    bare_soil_pct <- 100 * landcover_totals["3"]
+    water_pct <- 100 * landcover_totals["4"]
+    buildings_pct <- 100 * landcover_totals["5"]
+    roads_pct <- 100 * landcover_totals["6"]
+    other_imp_pct <- 100 * landcover_totals["7"]
+    railroads_pct <- 100 * landcover_totals["8"]
+    
+    building_mean <- mean(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+    building_median <- median(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+    height_categories <- prop.table(table(buildings_with_height$height_category))
+    building_low_pct <- 100 * height_categories["Low"]
+    building_medium_pct <- 100 * height_categories["Medium"]
+    building_tall_pct <- 100 * height_categories["Tall"]
+    
+    if ("cnstrct_yr" %in% names(buildings_with_height)) {
+      building_age_mean <- round(mean(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE))
+      building_age_median <- median(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE)
+    } else {
+      building_age_mean <- NA
+      building_age_median <- NA
+    }
+    
+    # Create a row for the current sensor
+    computed_row <- data.frame(
+      Sensor.ID = sensor_id,
+      Latitude = latitude,
+      Longitude = longitude,
+      Buffer = buffer_distance,
+      TreeCanopy_pct = tree_canopy_pct,
+      GrassShrubs_pct = grass_shrubs_pct,
+      BareSoil_pct = bare_soil_pct,
+      Water_pct = water_pct,
+      Buildings_pct = buildings_pct,
+      Roads_pct = roads_pct,
+      OtherImp_pct = other_imp_pct,
+      Railroads_pct = railroads_pct,
+      Building_mean = building_mean,
+      Building_median = building_median,
+      BuildingAge_mean = building_age_mean,
+      BuildingAge_median = building_age_median,
+      BuildingLow_pct = building_low_pct,
+      BuildingMedium_pct = building_medium_pct,
+      BuildingTall_pct = building_tall_pct,
+      stringsAsFactors = FALSE
+    )
+    
+    # Append the row to the chunk data frame
+    chunk_df <- bind_rows(chunk_df, computed_row)
+  }
+  
+  # Save the chunk to a DataFrame file as a checkpoint
+  chunk_file <- file.path(save_path, paste0("chunk_", start_row, "_to_", end_row, ".csv"))
+  write.csv(chunk_df, file = chunk_file, row.names = FALSE)
+  
+  # Print checkpoint status
+  message("Saved chunk: ", chunk_file)
+}
+
+print("All chunks processed and saved.")
+
+```
+
+
+# for remaining chunks that were not processed 
+```{r}
+# Define buffer distance
+buffer_distance <- 250
+
+# Number of locations per chunk
+chunk_size <- 20
+
+# Total number of rows
+total_rows <- nrow(hyptemp)
+
+# Define the save path
+save_path <- "/Volumes/Elements/R/Projects/LandCover/LandCover_dfs"
+
+# Get a list of already processed files
+processed_files <- list.files(save_path, pattern = "chunk_.*\\.csv", full.names = TRUE)
+
+# Extract processed row ranges from file names
+processed_ranges <- gsub(".*chunk_(\\d+)_to_(\\d+)\\.csv", "\\1-\\2", processed_files)
+processed_start_rows <- as.numeric(sub("-.*", "", processed_ranges))
+
+# Find the start rows for unprocessed chunks
+all_start_rows <- seq(1, total_rows, by = chunk_size)
+unprocessed_start_rows <- setdiff(all_start_rows, processed_start_rows)
+
+# Loop through unprocessed chunks
+for (start_row in unprocessed_start_rows) {
+  # Get the end row for the current chunk
+  end_row <- min(start_row + chunk_size - 1, total_rows)
+  
+  # Subset the current chunk
+  chunk <- hyptemp[start_row:end_row, ]
+  
+  # Initialize a temporary data frame for the current chunk's results
+  chunk_df <- data.frame(
+    Sensor.ID = character(),
+    Latitude = numeric(),
+    Longitude = numeric(),
+    Buffer = numeric(),
+    TreeCanopy_pct = numeric(),
+    GrassShrubs_pct = numeric(),
+    BareSoil_pct = numeric(),
+    Water_pct = numeric(),
+    Buildings_pct = numeric(),
+    Roads_pct = numeric(),
+    OtherImp_pct = numeric(),
+    Railroads_pct = numeric(),
+    Building_mean = numeric(),
+    Building_median = numeric(),
+    BuildingAge_mean = numeric(),
+    BuildingAge_median = numeric(),
+    BuildingLow_pct = numeric(),
+    BuildingMedium_pct = numeric(),
+    BuildingTall_pct = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each row in the chunk
+  for (i in seq_len(nrow(chunk))) {
+    # Extract sensor information
+    sensor_id <- chunk$Sensor.ID[i]
+    latitude <- chunk$Latitude[i]
+    longitude <- chunk$Longitude[i]
+    
+    # Call the function for the current sensor
+    result <- generate_landcover_and_building_data(
+      coordinates = c(longitude, latitude),
+      buffer_distance = buffer_distance,
+      landcover_raster = landcover_raster,
+      buildings_geojson = buildings_geojson,
+      hyptemp = chunk
+    )
+    
+    # Extract and compute results (as in the original loop)
+    landcover_data <- result$landcover
+    buildings_with_height <- result$buildings_with_height
+    landcover_totals <- prop.table(table(landcover_data$landcover_value))
+    
+    # Calculate landcover and building metrics
+    tree_canopy_pct <- 100 * landcover_totals["1"]
+    grass_shrubs_pct <- 100 * landcover_totals["2"]
+    bare_soil_pct <- 100 * landcover_totals["3"]
+    water_pct <- 100 * landcover_totals["4"]
+    buildings_pct <- 100 * landcover_totals["5"]
+    roads_pct <- 100 * landcover_totals["6"]
+    other_imp_pct <- 100 * landcover_totals["7"]
+    railroads_pct <- 100 * landcover_totals["8"]
+    
+    building_mean <- mean(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+    building_median <- median(as.numeric(buildings_with_height$heightroof), na.rm = TRUE)
+    height_categories <- prop.table(table(buildings_with_height$height_category))
+    building_low_pct <- 100 * height_categories["Low"]
+    building_medium_pct <- 100 * height_categories["Medium"]
+    building_tall_pct <- 100 * height_categories["Tall"]
+    
+    if ("cnstrct_yr" %in% names(buildings_with_height)) {
+      building_age_mean <- round(mean(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE))
+      building_age_median <- median(year(as.Date(buildings_with_height$cnstrct_yr, format = "%Y")), na.rm = TRUE)
+    } else {
+      building_age_mean <- NA
+      building_age_median <- NA
+    }
+    
+    # Create a row for the current sensor
+    computed_row <- data.frame(
+      Sensor.ID = sensor_id,
+      Latitude = latitude,
+      Longitude = longitude,
+      Buffer = buffer_distance,
+      TreeCanopy_pct = tree_canopy_pct,
+      GrassShrubs_pct = grass_shrubs_pct,
+      BareSoil_pct = bare_soil_pct,
+      Water_pct = water_pct,
+      Buildings_pct = buildings_pct,
+      Roads_pct = roads_pct,
+      OtherImp_pct = other_imp_pct,
+      Railroads_pct = railroads_pct,
+      Building_mean = building_mean,
+      Building_median = building_median,
+      BuildingAge_mean = building_age_mean,
+      BuildingAge_median = building_age_median,
+      BuildingLow_pct = building_low_pct,
+      BuildingMedium_pct = building_medium_pct,
+      BuildingTall_pct = building_tall_pct,
+      stringsAsFactors = FALSE
+    )
+    
+    # Append the row to the chunk data frame
+    chunk_df <- bind_rows(chunk_df, computed_row)
+  }
+  
+  # Save the chunk to a DataFrame file as a checkpoint
+  chunk_file <- file.path(save_path, paste0("chunk_", start_row, "_to_", end_row, ".csv"))
+  write.csv(chunk_df, file = chunk_file, row.names = FALSE)
+  
+  # Print checkpoint status
+  message("Saved chunk: ", chunk_file)
+}
+
+print("Remaining chunks processed and saved.")
+
+```
+

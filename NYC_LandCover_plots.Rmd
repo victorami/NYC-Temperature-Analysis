@@ -1,0 +1,160 @@
+---
+title: "NYC_LandCover_plots"
+output: html_document
+date: "2024-11-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(sf)
+library(raster)
+library(dplyr)
+library(ggplot2)
+library(ggnewscale)
+```
+
+```{r}
+plot_landcover_with_buildings <- function(
+  coordinates,       # Numeric vector: c(longitude, latitude)
+  buffer_distance,   # Numeric: Buffer distance in the CRS unit
+  landcover_raster,  # RasterLayer: The landcover raster
+  buildings_geojson, # Filepath or sf object: The building footprints GeoJSON
+  hyptemp,           # DataFrame: Contains temperature data with Latitude and Longitude columns
+  output_file = NULL # Optional: Filepath for saving the plot
+) {
+  # Helper function to reproject and clip spatial data
+  reproject_and_clip <- function(data, target_crs, extent_bbox) {
+    data_transformed <- st_transform(data, crs = target_crs)
+    data_clipped <- st_intersection(data_transformed, st_as_sf(extent_bbox))
+    return(data_clipped)
+  }
+  
+  # Step 1: Define the input point in WGS84 and transform it to the raster's CRS
+  point_sf <- st_sfc(st_point(coordinates), crs = 4326)
+  point_transformed <- st_transform(point_sf, crs = st_crs(landcover_raster))
+  
+  # Step 2: Create a buffer and crop the raster
+  buffer <- st_buffer(point_transformed, dist = buffer_distance)
+  bbox <- st_bbox(buffer)
+  cropped_raster <- crop(landcover_raster, extent(bbox$xmin, bbox$xmax, bbox$ymin, bbox$ymax))
+  raster_extent <- as(extent(cropped_raster), "SpatialPolygons")
+  crs(raster_extent) <- crs(landcover_raster)
+  
+  # Step 3: Read and preprocess buildings GeoJSON
+  buildings_sf <- if (is.character(buildings_geojson)) {
+    st_read(buildings_geojson, quiet = TRUE)
+  } else {
+    buildings_geojson
+  }
+  
+  # Step 4: Filter buildings with missing and known height values
+  buildings_with_height <- buildings_sf %>%
+    filter(!is.na(heightroof))
+  
+  buildings_without_height <- buildings_sf %>%
+    filter(is.na(heightroof))
+  
+  # Step 5: Reproject and clip buildings to raster extent
+  buildings_with_height_clipped <- reproject_and_clip(buildings_with_height, crs(landcover_raster), raster_extent)
+  buildings_without_height_clipped <- reproject_and_clip(buildings_without_height, crs(landcover_raster), raster_extent)
+  
+  # Step 6: Classify buildings by height
+  buildings_with_height_clipped <- buildings_with_height_clipped %>%
+    mutate(height_category = case_when(
+      heightroof <= 20 ~ "Low",
+      heightroof <= 40 ~ "Medium",
+      heightroof > 40 ~ "Tall",
+      TRUE ~ "Unknown"
+    ))
+  
+  # Step 7: Filter hyptemp dataset for the sensors in the area of interest
+  hyptemp_sf <- st_as_sf(hyptemp, coords = c("Longitude", "Latitude"), crs = 4326)
+  hyptemp_clipped <- reproject_and_clip(hyptemp_sf, crs(landcover_raster), raster_extent)
+  
+  # Step 8: Define color schemes
+  landcover_colors <- c(
+    "1" = "green4",        # Tree Canopy
+    "2" = "lightgreen",    # Grass/Shrubs
+    "3" = "orange4",       # Bare Soil
+    "4" = "blue",          # Water
+    "5" = "red2",          # Buildings
+    "6" = "gray48",        # Roads
+    "7" = "gray4",         # Other Impervious
+    "8" = "purple4"        # Railroads
+  )
+  building_colors <- c("Low" = "indianred1", "Medium" = "red", "Tall" = "red4")
+  
+  # Step 9: Print unique raster values and their assigned colors
+  unique_values <- unique(values(cropped_raster))
+  assigned_colors <- landcover_colors[as.character(unique_values)]
+  print(paste("Unique raster values and their colors:", paste(unique_values, assigned_colors, sep = " -> ", collapse = "; ")))
+  
+  # Step 10: Create the plot using ggplot2
+  raster_df <- as.data.frame(rasterToPoints(cropped_raster), xy = TRUE)
+  names(raster_df)[3] <- "value"
+  
+  buildings_with_height_clipped$height_category <- factor(buildings_with_height_clipped$height_category, levels = c("Low", "Medium", "Tall"))
+  
+  plot <- ggplot() +
+    # Raster layer with its own fill scale
+    geom_raster(data = raster_df, aes(x = x, y = y, fill = as.factor(value))) +
+    scale_fill_manual(values = landcover_colors, name = "Landcover") +
+    
+    # Add a new scale for buildings with height data
+    new_scale_fill() +
+    geom_sf(data = buildings_with_height_clipped, aes(fill = height_category), color = "black", size = 0.2) +
+    scale_fill_manual(values = building_colors, name = "Building Height") +
+    
+    # Add buildings without height data with dashed or dotted outline
+    geom_sf(data = buildings_without_height_clipped, color = "white", fill = NA, linetype = "dashed", size = 1) +
+    
+    # Plot the sensors as circles
+    geom_sf(data = hyptemp_clipped, color = "black", shape = 21, size = 3, fill = "yellow") + 
+    
+    # General plot settings
+    theme_void() +
+    labs(title = "Landcover, Buildings, and Sensor Locations", fill = "Category") +
+    theme(legend.position = "bottom")
+  
+  # Save or display the plot
+  if (!is.null(output_file)) {
+    ggsave(output_file, plot, width = 10, height = 10, dpi = 300)
+  } else {
+    print(plot)
+  }
+}
+
+```
+
+```{r, fig.height = 10, fig.width = 10, echo = F}
+landcover_raster <- raster("/Volumes/Elements/Data/Land_Cover/NYC_2017_LiDAR_LandCover.img")
+buildings_geojson <- "/Volumes/Elements/Data/Building_Footprints/Building Footprints_20241119.geojson"
+temperature <- read.csv("/Volumes/Elements/Data/Hyperlocal_Temperature_NYC/Hyperlocal_Temperature_Monitoring_20240919.csv")
+
+hyptemp <- temperature[!duplicated(temperature$Sensor.ID), c("Sensor.ID", "Latitude", "Longitude")]
+rownames(hyptemp) <- NULL
+
+coordinates <- c(hyptemp$Longitude[1],hyptemp$Latitude[1])
+buffer_distance <- 250
+
+# Call the function
+plot_landcover_with_buildings(
+  coordinates = coordinates,
+  buffer_distance = buffer_distance,
+  landcover_raster = landcover_raster,
+  buildings_geojson = buildings_geojson,
+  hyptemp = hyptemp,
+  output_file = "/Volumes/Elements/R/Projects/LandCoverImages/SensorBk-BR_01Buffer250.png"
+)
+```
+
+
+
+
+
+
+
+
