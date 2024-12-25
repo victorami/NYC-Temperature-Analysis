@@ -1,4 +1,4 @@
-# Land Cover Influence on NYC Block Temperatures (WIP)
+# Land Cover Impact on NYC Block Temperatures (WIP)
 
 This project aims to understand the influence of land cover and building height on temperature at the city block level in New York City. By using high-resolution datasets, it seeks to accurately predict temperature for locations without sensors based on environmental factors and visualize temperature variation across the city. This work aims to recreate the project outlined in the article: [*The Urban Heat Island Effect in NYC*](https://a816-dohbesp.nyc.gov/IndicatorPublic/data-stories/urban-heat-island/).
 
